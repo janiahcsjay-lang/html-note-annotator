@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "HTML 标注笔记",
+  "version": "2.0.0",
+  "description": "在任何页面上做标注：点哪标哪、一键隐藏、可编辑页面内容、可导出带标注的 HTML 文件。",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "background": { "service_worker": "sw.js" },
+  "action": {
+    "default_title": "HTML 标注笔记（点击开启 / 收起）",
+    "default_icon": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "web_accessible_resources": [
+    { "resources": ["inject.js"], "matches": ["<all_urls>"] }
+  ]
+}

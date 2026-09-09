@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>标注总览</title>
+<style>
+  body{margin:0;background:#F5F6F3;color:#2C2A26;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;font-size:14px;line-height:1.7}
+  .wrap{max-width:860px;margin:0 auto;padding:40px 20px 80px}
+  h1{font-size:20px;color:#1F401B;margin:0 0 4px}
+  .meta{font-size:12px;color:#7A776F;margin-bottom:24px}
+  .card{background:#FFFEFA;border:1px solid #E3E2DA;border-radius:12px;padding:12px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  .name{font-weight:600;color:#1F401B;word-break:break-all}
+  .sub{font-size:11px;color:#7A776F;word-break:break-all;flex-basis:100%;margin-top:-4px}
+  .cnt{font-size:12px;color:#7A776F;white-space:nowrap}
+  .cnt b{color:#B4781F;font-weight:600}
+  .ops{margin-left:auto;display:flex;gap:6px}
+  button{font-size:12px;padding:5px 12px;border-radius:999px;border:1px solid #D8D5CC;background:#FFFEFA;color:#2C2A26;cursor:pointer}
+  button.pri{background:#1F401B;color:#F3F4EE;border-color:#1F401B}
+  button[data-armed]{color:#A0341C;border-color:#A0341C}
+  .empty{color:#7A776F;background:#FFFEFA;border:1px dashed #D8D5CC;border-radius:12px;padding:30px;text-align:center}
+  .note{font-size:11px;color:#7A776F;margin-top:20px;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>标注总览</h1>
+  <div class="meta" id="meta">读取中…</div>
+  <div id="list"></div>
+  <p class="note">标注按网址存在本机浏览器里。文件改名或移动后，打开新文件 → 点「标注」→ 空状态下选「从其他文件导入标注」即可迁移。单独导出的 _标注.html 文件里的标注在文件自身，不在这里。</p>
+</div>
+<script src="overview.js"></script>
+</body>
+</html>
