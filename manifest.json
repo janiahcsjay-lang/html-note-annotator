@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "HTML 标注笔记",
-  "version": "2.0.0",
+  "version": "3.0.1",
   "description": "在任何页面上做标注：点哪标哪、一键隐藏、可编辑页面内容、可导出带标注的 HTML 文件。",
   "permissions": ["activeTab", "scripting", "storage"],
   "background": { "service_worker": "sw.js" },

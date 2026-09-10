@@ -1,9 +1,10 @@
-/* HTML 标注笔记 v2 —— 注入式标注层
+/* HTML 标注笔记 v3 —— 注入式标注层
  * 同一份代码三种活法：
  *  1) Chrome 插件 content script（点图标注入，chrome.storage 按 URL 存标注）
  *  2) 被「导出」进 HTML 文件后随文件自启（标注嵌在文件里，localStorage 存草稿）
  *  3) 手动 <script> 引入任何页面
- * 标注三种锚：元素（点选）、划词（文字选区）、框选（拖矩形，挂在承载元素上按比例记忆）。
+ * 标注三种锚：元素（点选）、划词/划线（文字选区）、框选（拖矩形按比例挂在承载元素上）。
+ * v3：阅读模式（选中即划线、三色、随手想法）；所有书写动作在原地小气泡完成，右侧面板只作清单管理。
  */
 (function () {
   "use strict";
@@ -16,19 +17,18 @@
   try { hasRuntime = !!(typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage && chrome.runtime.id); } catch (e) { hasRuntime = false; }
   var DOCKEY = "hna:" + String(location.href).split("#")[0];
 
-  var CATS = { copy: "文案", visual: "视觉", interact: "交互", question: "疑问" };
-  var CATCOLOR = { copy: "#B4781F", visual: "#2E7D6E", interact: "#3A6EA5", question: "#8A6FB8" };
+  var CATS = { copy: "文案", visual: "视觉", interact: "交互", question: "疑问", note: "想法" };
+  var CATCOLOR = { copy: "#B4781F", visual: "#2E7D6E", interact: "#3A6EA5", question: "#8A6FB8", note: "#5F6B7A" };
   var SEVS = { must: "必改", suggest: "建议" };
+  var HLS = ["#F6D55C", "#9BC995", "#F1A9A0"]; /* 划线三色：黄 / 绿 / 粉 */
 
   /* ---------------- 状态 ---------------- */
-  var notes = [];            // {id, kind:'el'|'text'|'rect', sel, tag, snippet, label, text, cat, sev, time, done, exact?, prefix?, suffix?, rx?, ry?, rw?, rh?}
+  var notes = [];
   var hidden = false;
-  var annotating = false;    // 标注（点选 + 划词）
-  var regioning = false;     // 框选
-  var editing = false;
+  var annotating = false, regioning = false, editing = false, reading = false;
   var activeId = null;
-  var composing = null;      // {kind, label, ...锚点字段}
-  var editingNoteId = null;
+  var composing = null;      // {kind, label, ...} 评审类书写中
+  var editingNoteId = null;  // 面板里改文字
   var hoverEl = null;
   var uiVisible = true;
   var catFilter = "all";
@@ -40,7 +40,10 @@
   var saveTimer = null, pinTimer = null, toastTimer = null;
   var prevBodyEditable = null;
   var lastTextComposeAt = 0;
-  var drag = null;           // 框选进行中 {x0,y0,x1,y1} (doc coords)
+  var drag = null;
+  var pendingSel = null;     // 阅读模式待处理的选区
+  var bubMode = null;        // 'sel' | 'compose' | 'mark' | 'view'
+  var bubNoteId = null;
 
   /* ---------------- 小工具 ---------------- */
   function el(tag, cls) { var e = d.createElement(tag); if (cls) e.className = cls; return e; }
@@ -49,8 +52,9 @@
   function fmt(ms) { var t = new Date(ms); return pad(t.getMonth() + 1) + "-" + pad(t.getDate()) + " " + pad(t.getHours()) + ":" + pad(t.getMinutes()); }
   function newId() { return "n" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
   function snip(t, n) { t = String(t || "").replace(/\s+/g, " ").trim(); return t.length > n ? t.slice(0, n) + "…" : t; }
+  function isMark(n) { return !!n.hl && !(n.text && n.text.trim()); }
   function catName(n) { return CATS[n.cat] || CATS.visual; }
-  function catColor(n) { return CATCOLOR[n.cat] || CATCOLOR.visual; }
+  function catColor(n) { return n.hl || CATCOLOR[n.cat] || CATCOLOR.visual; }
   function inUI(node) { return !!(node && node.nodeType === 1 && (ui.root.contains(node) || ui.pins.contains(node))); }
 
   /* ---------------- 存取 ---------------- */
@@ -94,11 +98,11 @@
     if (n.sel) { try { cand = d.querySelector(n.sel); } catch (e) { cand = null; } }
     if (cand && inUI(cand)) cand = null;
     if (cand) {
-      if (!n.snippet || n.snippet.indexOf("[") === 0) return cand; /* 图类内容无法用文字校验，认结构 */
+      if (!n.snippet || n.snippet.indexOf("[") === 0) return cand;
       var t = String(cand.textContent || "").replace(/\s+/g, " ").trim();
       var want0 = n.snippet.replace(/…$/, "");
       if (t.indexOf(want0) === 0) return cand;
-      cand = null; /* 结构对得上但内容不是它——多半是交互切到了别的画面 */
+      cand = null;
     }
     if (n.snippet && n.snippet.indexOf("[") !== 0 && n.tag) {
       var want = n.snippet.replace(/…$/, "");
@@ -126,7 +130,7 @@
     return tag + (cls ? "." + cls : "") + (txt ? "「" + txt + "」" : "");
   }
 
-  /* ---------------- 划词锚（文字选区） ---------------- */
+  /* ---------------- 划词/划线锚 ---------------- */
   function grabSelection() {
     var s = window.getSelection && window.getSelection();
     if (!s || s.isCollapsed || !s.rangeCount) return null;
@@ -139,11 +143,14 @@
     if (c === d.body || c === d.documentElement) return "toobig";
     var pre = d.createRange(); pre.selectNodeContents(c); pre.setEnd(r.startContainer, r.startOffset);
     var suf = d.createRange(); suf.selectNodeContents(c); suf.setStart(r.endContainer, r.endOffset);
+    var rect = null;
+    try { rect = r.getBoundingClientRect(); } catch (e2) { rect = null; }
     return {
       kind: "text", sel: cssPath(c), tag: c.tagName.toLowerCase(),
       exact: exact, prefix: pre.toString().slice(-30), suffix: suf.toString().slice(0, 30),
       snippet: snip(c.textContent, 40) || "[图]",
-      label: "划词「" + snip(exact, 20) + "」"
+      label: "划词「" + snip(exact, 20) + "」",
+      rect: rect
     };
   }
   function sharedEnd(a, b) { var i = 0; while (i < a.length && i < b.length && a[a.length - 1 - i] === b[b.length - 1 - i]) i++; return i; }
@@ -151,10 +158,7 @@
   function resolveTextRange(n) {
     var c = null;
     if (n.sel) { try { c = d.querySelector(n.sel); } catch (e) { c = null; } }
-    if (!c || inUI(c)) {
-      /* 容器丢了就退回元素解析逻辑找容器 */
-      c = resolveEl({ sel: n.sel, tag: n.tag, snippet: n.snippet });
-    }
+    if (!c || inUI(c)) c = resolveEl({ sel: n.sel, tag: n.tag, snippet: n.snippet });
     if (!c) return null;
     var hay = c.textContent || "";
     var idxs = [], from = 0, ix;
@@ -178,14 +182,14 @@
     return (s1 && s2) ? range : null;
   }
 
-  /* ---------------- 框选锚（比例挂在承载元素上） ---------------- */
+  /* ---------------- 框选锚 ---------------- */
   function hostForPoint(vx, vy) {
     var elx = d.elementFromPoint(vx, vy);
     if (!elx || inUI(elx)) return d.body;
     var t = targetFor(elx);
     return t || d.body;
   }
-  function resolveRectBox(n) { /* 返回文档坐标 {left,top,width,height} */
+  function resolveRectBox(n) {
     var host = resolveEl(n);
     if (!host) return null;
     var r = host.getBoundingClientRect();
@@ -198,8 +202,8 @@
     };
   }
 
-  /* ---------------- 统一解析：note -> 文档坐标矩形组 ---------------- */
-  function noteBoxes(n) { /* {boxes:[{left,top,width,height}], pin:{x,y}} | null */
+  /* ---------------- 统一解析 ---------------- */
+  function noteBoxes(n) {
     var boxes = [], i, r;
     if (n.kind === "text") {
       var range = resolveTextRange(n);
@@ -237,6 +241,7 @@
     ".hna-bar button{font-size:12px;line-height:1.4;padding:6px 12px;border-radius:999px;border:1px solid #D8D5CC;background:#FFFEFA;color:#2C2A26;cursor:pointer;white-space:nowrap;box-shadow:0 2px 8px rgba(30,30,25,.10)}" +
     ".hna-bar button.hna-on{background:#1F401B;color:#F3F4EE;border-color:#1F401B}" +
     ".hna-bar button:focus-visible{outline:2px solid #B4781F;outline-offset:2px}" +
+    ".hna-pill{position:fixed;top:14px;right:14px;z-index:2147483200;width:36px;height:36px;border-radius:50%;border:1px solid #1F401B;background:#1F401B;color:#F3F4EE;font-size:13px;cursor:pointer;box-shadow:0 2px 10px rgba(30,30,25,.2)}" +
     ".hna-hint{position:fixed;top:52px;right:14px;z-index:2147483200;font-size:11px;color:#7A776F;background:#FFFEFA;border:1px solid #D8D5CC;border-radius:8px;padding:6px 10px;max-width:340px;line-height:1.55;box-shadow:0 2px 8px rgba(30,30,25,.08)}" +
     ".hna-toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:2147483300;font-size:12px;color:#F3F4EE;background:#1F401B;border-radius:10px;padding:8px 14px;max-width:calc(100vw - 28px);line-height:1.5;box-shadow:0 6px 18px rgba(20,35,28,.2)}" +
     "#hna-pins{position:absolute;left:0;top:0;width:100%;height:0;z-index:2147482900;pointer-events:none}" +
@@ -244,23 +249,39 @@
     ".hna-pin.hna-done{background:#FFFEFA!important;color:#7A776F;border-color:#7A776F;box-shadow:0 2px 6px rgba(20,35,28,.18)}" +
     ".hna-pin.hna-act{box-shadow:0 0 0 2px #1F401B,0 2px 6px rgba(20,35,28,.25)}" +
     ".hna-pin.hna-must{box-shadow:0 0 0 2px #C43D2B,0 2px 6px rgba(20,35,28,.25)}" +
-    ".hna-pin.hna-must.hna-act{box-shadow:0 0 0 2px #C43D2B,0 0 0 4px #1F401B}" +
     ".hna-mark{position:absolute;pointer-events:none;border-radius:2px}" +
     ".hna-rectmark{position:absolute;pointer-events:none;border:1.5px dashed #B4781F;border-radius:3px;background:rgba(180,120,31,.07)}" +
     ".hna-box{position:absolute;pointer-events:none;display:none;border-radius:3px}" +
     ".hna-boxh{outline:1.5px dashed #B4781F;outline-offset:2px}" +
     ".hna-boxt{outline:2px solid #B4781F;outline-offset:2px}" +
     ".hna-dragbox{position:absolute;pointer-events:none;border:1.5px dashed #B4781F;background:rgba(180,120,31,.10);border-radius:3px;display:none}" +
+    /* 原地小气泡 */
+    ".hna-bub{position:fixed;z-index:2147483240;background:#FFFEFA;border:1px solid #D8D5CC;border-radius:12px;box-shadow:0 8px 26px rgba(20,35,28,.18);padding:8px 10px;max-width:300px;min-width:120px;font-size:12px;color:#2C2A26}" +
+    ".hna-bub .hna-row{display:flex;align-items:center;gap:8px}" +
+    ".hna-dot{width:19px;height:19px;border-radius:50%;border:2px solid #FFF;box-shadow:0 0 0 1px #C9C6BC;cursor:pointer;flex:none;padding:0}" +
+    ".hna-dot.hna-cur{box-shadow:0 0 0 2px #1F401B}" +
+    ".hna-bub .hna-lnkb{border:0;background:transparent;color:#1F401B;font-size:12px;cursor:pointer;padding:2px 4px;white-space:nowrap}" +
+    ".hna-bub .hna-lnkb[data-armed]{color:#A0341C}" +
+    ".hna-bub .hna-x{border:0;background:transparent;color:#9B978C;font-size:13px;cursor:pointer;padding:2px 4px;margin-left:auto}" +
+    ".hna-bub textarea{display:block;width:100%;min-height:52px;font-size:12px;line-height:1.5;border:1px solid #D8D5CC;border-radius:8px;padding:6px 8px;resize:vertical;background:#FFFEFA;color:#2C2A26;margin-top:6px}" +
+    ".hna-bub .hna-tgt{font-size:10.5px;color:#7A776F;line-height:1.4;margin-bottom:2px;word-break:break-all;max-width:270px}" +
+    ".hna-bub .hna-text{margin:4px 0 2px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-width:270px}" +
+    ".hna-bub .hna-meta{font-size:10.5px;color:#7A776F}" +
+    ".hna-bub .hna-btns{display:flex;gap:6px;justify-content:flex-end;margin-top:6px}" +
+    ".hna-bub .hna-btns button{font-size:11px;padding:4px 10px;border-radius:999px;border:1px solid #D8D5CC;background:#FFFEFA;color:#2C2A26;cursor:pointer}" +
+    ".hna-bub .hna-btns button.hna-pri{background:#1F401B;color:#F3F4EE;border-color:#1F401B}" +
+    ".hna-chips{display:flex;gap:4px;flex-wrap:wrap;margin:4px 0 2px}" +
+    ".hna-chip{font-size:10.5px;padding:2px 9px;border-radius:999px;border:1px solid #D8D5CC;cursor:pointer;color:#5C5952;background:#FFFEFA;line-height:1.5}" +
+    ".hna-chip.on{color:#FFF;border-color:transparent;background:#1F401B}" +
+    ".hna-chip.on[data-cat=copy]{background:#B4781F}.hna-chip.on[data-cat=visual]{background:#2E7D6E}.hna-chip.on[data-cat=interact]{background:#3A6EA5}.hna-chip.on[data-cat=question]{background:#8A6FB8}.hna-chip.on[data-cat=note]{background:#5F6B7A}" +
+    ".hna-chip.on[data-sev=must]{background:#C43D2B}.hna-chip.on[data-sev=suggest]{background:#7A776F}" +
+    /* 面板（仅清单管理） */
     ".hna-panel{position:fixed;top:56px;right:14px;bottom:16px;width:330px;max-width:calc(100vw - 28px);z-index:2147483100;background:#FFFEFA;border:1px solid #D8D5CC;border-radius:14px;box-shadow:0 10px 30px rgba(20,35,28,.14);display:flex;flex-direction:column;overflow:hidden;font-size:12px;color:#2C2A26}" +
     ".hna-ph{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid #E3E2DA;font-weight:600;color:#1F401B}" +
     ".hna-ph label{font-weight:400;font-size:11px;color:#7A776F;margin-left:auto;display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap}" +
+    ".hna-ph .hna-exp{font-weight:400;font-size:11px;border:1px solid #D8D5CC;border-radius:999px;background:#FFFEFA;padding:2px 10px;cursor:pointer;color:#2C2A26}" +
     ".hna-pb{overflow:auto;padding:10px 12px;flex:1}" +
     ".hna-chint{font-size:10.5px;color:#7A776F;line-height:1.5;margin-bottom:8px}" +
-    ".hna-chips{display:flex;gap:4px;flex-wrap:wrap;margin:4px 0 8px}" +
-    ".hna-chip{font-size:10.5px;padding:2px 9px;border-radius:999px;border:1px solid #D8D5CC;cursor:pointer;color:#5C5952;background:#FFFEFA;line-height:1.5}" +
-    ".hna-chip.on{color:#FFF;border-color:transparent;background:#1F401B}" +
-    ".hna-chip.on[data-cat=copy]{background:#B4781F}.hna-chip.on[data-cat=visual]{background:#2E7D6E}.hna-chip.on[data-cat=interact]{background:#3A6EA5}.hna-chip.on[data-cat=question]{background:#8A6FB8}" +
-    ".hna-chip.on[data-sev=must]{background:#C43D2B}.hna-chip.on[data-sev=suggest]{background:#7A776F}" +
     ".hna-form{border:1px solid #C9B27A;background:#FBF7EE;border-radius:10px;padding:8px 10px;margin-bottom:10px}" +
     ".hna-tgt{font-size:10.5px;color:#7A776F;line-height:1.4;margin-bottom:4px;word-break:break-all}" +
     ".hna-panel textarea{display:block;width:100%;min-height:52px;font-size:12px;line-height:1.5;border:1px solid #D8D5CC;border-radius:8px;padding:6px 8px;resize:vertical;background:#FFFEFA;color:#2C2A26}" +
@@ -299,8 +320,7 @@
     }
     ui.root = el("div"); ui.root.id = "hna-ui"; ui.root.setAttribute("contenteditable", "false");
     ui.pins = el("div"); ui.pins.id = "hna-pins"; ui.pins.setAttribute("contenteditable", "false");
-    ui.markWrap = el("div");
-    ui.pinWrap = el("div");
+    ui.markWrap = el("div"); ui.pinWrap = el("div");
     ui.hoverBox = el("div", "hna-box hna-boxh");
     ui.targetBox = el("div", "hna-box hna-boxt");
     ui.dragBox = el("div", "hna-dragbox");
@@ -309,16 +329,19 @@
     ui.bar.innerHTML =
       '<button type="button" data-hna="note">标注</button>' +
       '<button type="button" data-hna="region">框选</button>' +
+      '<button type="button" data-hna="read">阅读</button>' +
       '<button type="button" data-hna="hide">隐藏标注</button>' +
       '<button type="button" data-hna="edit">编辑内容</button>' +
       '<button type="button" data-hna="list">清单</button>' +
       '<button type="button" data-hna="export">导出 HTML</button>' +
       (hasRuntime ? '<button type="button" data-hna="overview" title="所有标注过的文件">总览</button>' : "") +
       '<button type="button" data-hna="fold" title="收起（再点插件图标恢复）">收起</button>';
+    ui.pill = el("button", "hna-pill"); ui.pill.type = "button"; ui.pill.textContent = "读"; ui.pill.title = "阅读模式：点这里展开工具条"; ui.pill.hidden = true;
     ui.hint = el("div", "hna-hint"); ui.hint.hidden = true;
     ui.toast = el("div", "hna-toast"); ui.toast.hidden = true;
     ui.panel = el("aside", "hna-panel"); ui.panel.hidden = true;
-    ui.root.appendChild(ui.bar); ui.root.appendChild(ui.hint); ui.root.appendChild(ui.toast); ui.root.appendChild(ui.panel);
+    ui.bub = el("div", "hna-bub"); ui.bub.hidden = true;
+    ui.root.appendChild(ui.bar); ui.root.appendChild(ui.pill); ui.root.appendChild(ui.hint); ui.root.appendChild(ui.toast); ui.root.appendChild(ui.panel); ui.root.appendChild(ui.bub);
     d.body.appendChild(ui.root); d.body.appendChild(ui.pins);
   }
   function toast(msg, ms) {
@@ -332,6 +355,8 @@
     btn("note").classList.toggle("hna-on", annotating);
     btn("region").textContent = regioning ? "完成框选" : "框选";
     btn("region").classList.toggle("hna-on", regioning);
+    btn("read").textContent = reading ? "完成阅读" : "阅读";
+    btn("read").classList.toggle("hna-on", reading);
     btn("hide").textContent = hidden ? "显示标注" : "隐藏标注";
     btn("hide").classList.toggle("hna-on", hidden);
     btn("edit").textContent = editing ? "完成编辑" : "编辑内容";
@@ -355,6 +380,11 @@
     box.style.left = b.left + "px"; box.style.top = b.top + "px";
     box.style.width = b.width + "px"; box.style.height = b.height + "px";
   }
+  function unionBox(boxes) {
+    var l = 1e9, t = 1e9, r = -1e9, b = -1e9;
+    boxes.forEach(function (x) { l = Math.min(l, x.left); t = Math.min(t, x.top); r = Math.max(r, x.left + x.width); b = Math.max(b, x.top + x.height); });
+    return { left: l, top: t, width: r - l, height: b - t };
+  }
   function refreshTarget() {
     if (composing) {
       if (composing.kind === "el" && composing.el && d.contains(composing.el)) { positionBox(ui.targetBox, composing.el); return; }
@@ -373,45 +403,42 @@
     }
     ui.targetBox.style.display = "none";
   }
-  function unionBox(boxes) {
-    var l = 1e9, t = 1e9, r = -1e9, b = -1e9;
-    boxes.forEach(function (x) { l = Math.min(l, x.left); t = Math.min(t, x.top); r = Math.max(r, x.left + x.width); b = Math.max(b, x.top + x.height); });
-    return { left: l, top: t, width: r - l, height: b - t };
-  }
 
-  /* ---------------- 图钉与高亮渲染 ---------------- */
-  function visibleNotes() {
-    return notes.filter(function (n) {
-      if (n.done && !showDone) return false;
-      if (catFilter !== "all" && (n.cat || "visual") !== catFilter) return false;
-      return true;
-    });
+  /* ---------------- 图钉与高亮 ---------------- */
+  var lastMarkHits = []; /* [{id, boxes}] 供阅读模式点击命中 */
+  function visibleMatch(n) {
+    if (n.done && !showDone) return false;
+    if (catFilter === "mark") return isMark(n);
+    if (catFilter !== "all" && (isMark(n) || (n.cat || "visual") !== catFilter)) return false;
+    return true;
   }
   function schedulePins() { clearTimeout(pinTimer); pinTimer = setTimeout(renderPins, 120); }
   function renderPins() {
     ui.pinWrap.innerHTML = ""; ui.markWrap.innerHTML = "";
+    lastMarkHits = [];
     if (hidden || !uiVisible || capturing) { positionBox(ui.hoverBox, null); positionBoxAt(ui.targetBox, null); return; }
     refreshTarget();
     var per = {};
     notes.forEach(function (n, idx) {
-      if (n.done && !showDone) return;
-      if (catFilter !== "all" && (n.cat || "visual") !== catFilter) return;
+      if (!visibleMatch(n)) return;
       var nb = noteBoxes(n); if (!nb) return;
       var col = catColor(n);
+      if (nb.boxes.length) lastMarkHits.push({ id: n.id, boxes: nb.boxes });
       nb.boxes.forEach(function (b2) {
         var m = el("div", nb.rectStyle ? "hna-rectmark" : "hna-mark");
         m.style.left = b2.left + "px"; m.style.top = b2.top + "px";
         m.style.width = b2.width + "px"; m.style.height = b2.height + "px";
         if (nb.rectStyle) { m.style.borderColor = col; m.style.background = hexA(col, n.id === activeId ? 0.14 : 0.07); }
-        else { m.style.background = hexA(col, n.id === activeId ? 0.4 : 0.24); }
+        else { m.style.background = hexA(col, n.id === activeId ? (n.hl ? 0.55 : 0.4) : (n.hl ? 0.34 : 0.24)); }
         ui.markWrap.appendChild(m);
       });
+      if (isMark(n)) return; /* 纯划线不出钉子，划线本身就是标记 */
       var key = (n.sel || "") + "|" + (n.kind || "el"), c = per[key] || 0; per[key] = c + 1;
       var p = el("div", "hna-pin" + (n.done ? " hna-done" : "") + (n.id === activeId ? " hna-act" : "") + (n.sev === "must" && !n.done ? " hna-must" : ""));
       p.textContent = idx + 1;
       p.title = catName(n) + (n.sev === "must" ? "·必改" : "") + "：" + n.text;
       p.setAttribute("data-id", n.id);
-      p.style.background = n.done ? "" : col;
+      p.style.background = n.done ? "" : (n.hl ? CATCOLOR[n.cat || "note"] || "#5F6B7A" : col);
       p.style.left = (nb.pin.x - c * 22) + "px";
       p.style.top = nb.pin.y + "px";
       ui.pinWrap.appendChild(p);
@@ -422,8 +449,106 @@
     if (!m) return hex;
     return "rgba(" + parseInt(m[1], 16) + "," + parseInt(m[2], 16) + "," + parseInt(m[3], 16) + "," + a + ")";
   }
+  function findMarkAt(px, py) {
+    for (var i = lastMarkHits.length - 1; i >= 0; i--) {
+      var h = lastMarkHits[i];
+      for (var j = 0; j < h.boxes.length; j++) {
+        var b = h.boxes[j];
+        if (px >= b.left - 2 && px <= b.left + b.width + 2 && py >= b.top - 2 && py <= b.top + b.height + 2) return byId(h.id);
+      }
+    }
+    return null;
+  }
 
-  /* ---------------- 面板 ---------------- */
+  /* ---------------- 原地气泡 ---------------- */
+  var bubShownAt = 0;
+  function showBubbleAt(vx, vy) {
+    bubShownAt = Date.now();
+    ui.bub.hidden = false;
+    ui.bub.style.left = "0px"; ui.bub.style.top = "0px";
+    var w = ui.bub.offsetWidth, h = ui.bub.offsetHeight;
+    var x = Math.min(Math.max(8, vx - w / 2), window.innerWidth - w - 8);
+    var y = vy + 10;
+    if (y + h > window.innerHeight - 8) y = Math.max(8, vy - h - 12);
+    ui.bub.style.left = x + "px"; ui.bub.style.top = y + "px";
+  }
+  function hideBubble() {
+    ui.bub.hidden = true; bubMode = null; bubNoteId = null; pendingSel = null;
+    if (composing) { composing = null; refreshTarget(); }
+  }
+  function dotsHTML(cur) {
+    return HLS.map(function (c) {
+      return '<button type="button" class="hna-dot' + (cur === c ? " hna-cur" : "") + '" data-dot="' + c + '" style="background:' + c + '"></button>';
+    }).join("");
+  }
+  function chipsHTML(cat, sev, withSev) {
+    var h = '<div class="hna-chips">';
+    Object.keys(CATS).forEach(function (k) { h += '<span class="hna-chip' + (cat === k ? " on" : "") + '" data-cat="' + k + '">' + CATS[k] + "</span>"; });
+    if (withSev !== false) {
+      h += '<span style="width:6px"></span>';
+      Object.keys(SEVS).forEach(function (k) { h += '<span class="hna-chip' + (sev === k ? " on" : "") + '" data-sev="' + k + '">' + SEVS[k] + "</span>"; });
+    }
+    return h + "</div>";
+  }
+  function bubSelection(vx, vy) {
+    bubMode = "sel";
+    ui.bub.innerHTML = '<div class="hna-row">' + dotsHTML(null) +
+      '<button type="button" class="hna-lnkb" data-bub="idea">写想法</button>' +
+      '<button type="button" class="hna-x" data-bub="close">✕</button></div>';
+    showBubbleAt(vx, vy);
+  }
+  function bubIdeaForm(vx, vy) {
+    bubMode = "idea";
+    ui.bub.innerHTML = '<div class="hna-tgt">' + esc(pendingSel ? pendingSel.label : "") + "</div>" +
+      '<div class="hna-row">' + dotsHTML(pendingSel && pendingSel.hlPick || HLS[0]) + "</div>" +
+      '<textarea placeholder="写点想法…（Enter 提交，Shift+Enter 换行）" data-role="text"></textarea>' +
+      '<div class="hna-btns"><button type="button" data-bub="close">取消</button><button type="button" class="hna-pri" data-bub="save-idea">保存</button></div>';
+    showBubbleAt(vx, vy);
+    var ta = ui.bub.querySelector("textarea"); if (ta) ta.focus();
+  }
+  function bubCompose(vx, vy) {
+    bubMode = "compose";
+    ui.bub.innerHTML = '<div class="hna-tgt">位置：' + esc(composing.label) + "</div>" +
+      chipsHTML(lastCat, lastSev) +
+      '<textarea placeholder="写点什么…（Enter 提交，Shift+Enter 换行）" data-role="text"></textarea>' +
+      '<div class="hna-btns"><button type="button" data-bub="close">取消</button><button type="button" class="hna-pri" data-bub="post">保存</button></div>';
+    showBubbleAt(vx, vy);
+    var ta = ui.bub.querySelector("textarea"); if (ta) ta.focus();
+  }
+  function bubNote(n, vx, vy, editNow) {
+    bubMode = "view"; bubNoteId = n.id;
+    setActive(n.id);
+    var h = "";
+    if (isMark(n)) {
+      h = '<div class="hna-row">' + dotsHTML(n.hl) +
+        '<button type="button" class="hna-lnkb" data-bub="add-idea">写想法</button>' +
+        '<button type="button" class="hna-lnkb" data-bub="del">删除划线</button>' +
+        '<button type="button" class="hna-x" data-bub="close">✕</button></div>';
+    } else if (editNow) {
+      h = '<div class="hna-tgt">' + esc(n.label) + "</div>" +
+        chipsHTML(n.cat || "visual", n.sev || "suggest") +
+        '<textarea data-role="text">' + esc(n.text) + "</textarea>" +
+        '<div class="hna-btns"><button type="button" data-bub="close">取消</button><button type="button" class="hna-pri" data-bub="save-edit">保存</button></div>';
+    } else {
+      h = '<div class="hna-tgt"><span class="hna-cat" style="background:' + catColor(n) + '">' + catName(n) + "</span>" +
+        (n.sev === "must" ? '<span class="hna-sev">必改</span> ' : "") + esc(n.label) + "</div>" +
+        '<div class="hna-text">' + esc(n.text) + "</div>";
+      if (n.replies && n.replies.length) {
+        n.replies.forEach(function (r2) { h += '<div class="hna-text" style="border-left:2px solid #E3E2DA;padding-left:8px;color:#5C5952">↳ ' + esc((r2.author ? r2.author + "：" : "") + r2.text) + "</div>"; });
+      }
+      h += '<div class="hna-meta">' + fmt(n.time) + (n.done ? " · 已完成" : "") + "</div>" +
+        '<div class="hna-btns" style="justify-content:flex-start;gap:2px">' +
+        '<button type="button" class="hna-lnkb" data-bub="edit">修改</button>' +
+        '<button type="button" class="hna-lnkb" data-bub="done">' + (n.done ? "重开" : "完成") + "</button>" +
+        '<button type="button" class="hna-lnkb" data-bub="del">删除</button>' +
+        '<button type="button" class="hna-x" data-bub="close">✕</button></div>';
+    }
+    ui.bub.innerHTML = h;
+    showBubbleAt(vx, vy);
+  }
+  ;
+
+  /* ---------------- 面板（清单管理） ---------------- */
   var panelOpen = false;
   function setActive(id) { activeId = id; refreshTarget(); }
   function byId(id) { for (var i = 0; i < notes.length; i++) if (notes[i].id === id) return notes[i]; return null; }
@@ -433,69 +558,65 @@
     var top = b.top - 120;
     if (b.top - window.pageYOffset < 80 || b.top + b.height - window.pageYOffset > window.innerHeight - 40) window.scrollTo({ top: top < 0 ? 0 : top, behavior: "smooth" });
   }
-  function chipsHTML(cat, sev) {
-    var h = '<div class="hna-chips">';
-    Object.keys(CATS).forEach(function (k) { h += '<span class="hna-chip' + (cat === k ? " on" : "") + '" data-cat="' + k + '">' + CATS[k] + "</span>"; });
-    h += '<span style="width:6px"></span>';
-    Object.keys(SEVS).forEach(function (k) { h += '<span class="hna-chip' + (sev === k ? " on" : "") + '" data-sev="' + k + '">' + SEVS[k] + "</span>"; });
-    return h + "</div>";
-  }
   function renderPanel() {
     if (ui.panel.hidden) return;
     var open = notes.filter(function (n) { return !n.done; }).length;
-    var must = notes.filter(function (n) { return !n.done && n.sev === "must"; }).length;
+    var must = notes.filter(function (n) { return !n.done && n.sev === "must" && !isMark(n); }).length;
+    var marks = notes.filter(isMark).length;
     var h = '<div class="hna-ph"><span>标注 ' + notes.length + (notes.length ? "（未完成 " + open + (must ? "，必改 " + must : "") + "）" : "") + "</span>" +
+      '<button type="button" class="hna-exp" data-act="export-open">导出</button>' +
       '<label><input type="checkbox" data-act="toggle-done"' + (showDone ? " checked" : "") + ">已完成</label>" +
       '<button type="button" class="hna-lnk" data-act="close" title="收起面板">✕</button></div>';
     var b = '<div class="hna-pb">';
-    b += '<div class="hna-chint">' + (annotating ? "点元素、或划选一段文字来标注；" : regioning ? "按住拖一个框来标注区域；" : "「标注」点选/划词，「框选」拖区域；") + "标注只在你这台电脑，「导出 HTML」存进文件。</div>";
-    /* 类型筛选 */
     if (notes.length) {
       b += '<div class="hna-chips"><span class="hna-chip' + (catFilter === "all" ? " on" : "") + '" data-filter="all">全部</span>';
+      if (marks) b += '<span class="hna-chip' + (catFilter === "mark" ? " on" : "") + '" data-filter="mark">划线 ' + marks + "</span>";
       Object.keys(CATS).forEach(function (k) {
-        var cnt = notes.filter(function (n) { return (n.cat || "visual") === k; }).length;
+        var cnt = notes.filter(function (n) { return !isMark(n) && (n.cat || "visual") === k; }).length;
         if (cnt) b += '<span class="hna-chip' + (catFilter === k ? " on" : "") + '" data-filter="' + k + '" data-cat="' + k + '">' + CATS[k] + " " + cnt + "</span>";
       });
       b += "</div>";
     }
-    if (composing) {
-      b += '<div class="hna-form"><div class="hna-tgt">位置：' + esc(composing.label) + "</div>" +
-        chipsHTML(lastCat, lastSev) +
-        '<textarea placeholder="写点什么…" data-role="text"></textarea>' +
-        '<div class="hna-btns"><button type="button" data-act="cancel">取消</button><button type="button" class="hna-pri" data-act="post">保存</button></div></div>';
-    }
-    if (!notes.length && !composing) {
-      b += '<div class="hna-empty">还没有标注。</div>';
+    if (!notes.length) {
+      b += '<div class="hna-empty">还没有标注。「标注」点选/划词，「框选」拖区域，「阅读」选中即划线。</div>';
       if (hasChrome && !importing) b += '<div class="hna-btns hna-left"><button type="button" class="hna-lnk" data-act="import">从其他文件导入标注…</button></div>';
     }
     if (importing) {
       b += '<div class="hna-form"><div class="hna-tgt">选择来源（比如这个文件改名前的记录），标注会复制过来，原记录保留：</div><div data-role="imports" class="hna-empty">读取中…</div>' +
         '<div class="hna-btns"><button type="button" data-act="cancel-import">取消</button></div></div>';
     }
-    var list = visibleNotes();
+    var list = notes.filter(visibleMatch);
     if (notes.length && !list.length) b += '<div class="hna-empty">该筛选下没有标注。</div>';
     list.forEach(function (n) {
       var idx = noteIndex(n);
       var nb = noteBoxes(n);
-      b += '<div class="hna-item' + (n.done ? " hna-done" : "") + (n.id === activeId ? " hna-act" : "") + '" data-id="' + n.id + '">' +
-        '<div class="hna-tgt"><span class="hna-num" style="background:' + catColor(n) + '">' + (idx + 1) + "</span>" +
-        '<span class="hna-cat" style="background:' + catColor(n) + '">' + catName(n) + "</span>" +
-        (n.sev === "must" ? '<span class="hna-sev">必改</span> ' : "") +
-        esc(n.label) + (nb ? "" : " <i>（不在当前画面，切到对应交互状态后会回来）</i>") + "</div>";
-      if (editingNoteId === n.id) {
-        b += '<div class="hna-form" style="margin-top:6px">' + chipsHTML(n.cat || "visual", n.sev || "suggest") +
-          '<textarea data-role="edittext">' + esc(n.text) + "</textarea>" +
-          '<div class="hna-btns"><button type="button" data-act="cancel-edit">取消</button><button type="button" class="hna-pri" data-act="save-edit" data-id="' + n.id + '">保存</button></div></div>';
+      b += '<div class="hna-item' + (n.done ? " hna-done" : "") + (n.id === activeId ? " hna-act" : "") + '" data-id="' + n.id + '">';
+      if (isMark(n)) {
+        b += '<div class="hna-tgt"><span class="hna-num" style="background:' + n.hl + ';color:#5C5330">' + (idx + 1) + "</span>划线摘录" + (nb ? "" : " <i>（不在当前画面）</i>") + "</div>" +
+          '<div class="hna-text">' + esc(snip(n.exact, 90)) + "</div>" +
+          '<div class="hna-meta">' + fmt(n.time) + "</div>";
       } else {
-        b += '<div class="hna-text">' + esc(n.text) + "</div>";
-        if (n.replies && n.replies.length) { /* 老版本文件里的回复，只读展示 */
-          n.replies.forEach(function (r2) { b += '<div class="hna-text" style="border-left:2px solid #E3E2DA;padding-left:8px;color:#5C5952">↳ ' + esc((r2.author ? r2.author + "：" : "") + r2.text) + "</div>"; });
+        b += '<div class="hna-tgt"><span class="hna-num" style="background:' + catColor(n) + '">' + (idx + 1) + "</span>" +
+          '<span class="hna-cat" style="background:' + catColor(n) + '">' + catName(n) + "</span>" +
+          (n.sev === "must" ? '<span class="hna-sev">必改</span> ' : "") +
+          esc(n.label) + (nb ? "" : " <i>（不在当前画面，切到对应交互状态后会回来）</i>") + "</div>";
+        if (editingNoteId === n.id) {
+          b += '<div class="hna-form" style="margin-top:6px">' + chipsHTML(n.cat || "visual", n.sev || "suggest") +
+            '<textarea data-role="edittext">' + esc(n.text) + "</textarea>" +
+            '<div class="hna-btns"><button type="button" data-act="cancel-edit">取消</button><button type="button" class="hna-pri" data-act="save-edit" data-id="' + n.id + '">保存</button></div></div>';
+        } else {
+          b += '<div class="hna-text">' + esc(n.text) + "</div>";
+          if (n.replies && n.replies.length) {
+            n.replies.forEach(function (r2) { b += '<div class="hna-text" style="border-left:2px solid #E3E2DA;padding-left:8px;color:#5C5952">↳ ' + esc((r2.author ? r2.author + "：" : "") + r2.text) + "</div>"; });
+          }
+          b += '<div class="hna-meta">' + fmt(n.time) + (n.done ? " · 已完成" : "") + "</div>";
         }
-        b += '<div class="hna-meta">' + fmt(n.time) + (n.done ? " · 已完成" : "") + "</div>" +
-          '<div class="hna-btns hna-left">' +
+      }
+      if (editingNoteId !== n.id) {
+        b += '<div class="hna-btns hna-left">' +
           '<button type="button" class="hna-lnk" data-act="locate" data-id="' + n.id + '">定位</button>' +
-          '<button type="button" class="hna-lnk" data-act="edit" data-id="' + n.id + '">修改</button>' +
-          '<button type="button" class="hna-lnk" data-act="done" data-id="' + n.id + '">' + (n.done ? "重开" : "完成") + "</button>" +
+          (isMark(n) ? "" : '<button type="button" class="hna-lnk" data-act="edit" data-id="' + n.id + '">修改</button>' +
+            '<button type="button" class="hna-lnk" data-act="done" data-id="' + n.id + '">' + (n.done ? "重开" : "完成") + "</button>") +
           '<button type="button" class="hna-lnk" data-act="del" data-id="' + n.id + '">删除</button></div>';
       }
       b += "</div>";
@@ -505,8 +626,7 @@
     if (importing) fillImports();
   }
   function openPanel() { panelOpen = true; ui.panel.hidden = false; renderPanel(); }
-  function closePanel() { panelOpen = false; ui.panel.hidden = true; composing = null; editingNoteId = null; importing = false; setActive(null); }
-
+  function closePanel() { panelOpen = false; ui.panel.hidden = true; editingNoteId = null; importing = false; setActive(null); }
   function fillImports() {
     storeGetAll(function (all) {
       var box = ui.panel.querySelector('[data-role="imports"]');
@@ -518,7 +638,7 @@
         if (!ns.length) return;
         var name = k.slice(4);
         try { name = decodeURIComponent(name.split("/").pop() || name); } catch (e) {}
-        rows.push({ key: k, name: name || k, count: ns.length, t: v.t || 0 });
+        rows.push({ key: k, name: v.title || name || k, count: ns.length, t: v.t || 0 });
       });
       rows.sort(function (a, b2) { return b2.t - a.t; });
       if (!rows.length) { box.textContent = "没有其他文件的标注记录。"; return; }
@@ -528,7 +648,7 @@
     });
   }
 
-  /* ---------------- 模式与交互 ---------------- */
+  /* ---------------- 模式 ---------------- */
   function targetFor(node) {
     if (!node) return null;
     if (node.nodeType !== 1) node = node.parentElement;
@@ -540,44 +660,74 @@
     return node;
   }
   function setHover(node) { hoverEl = node; positionBox(ui.hoverBox, node); }
+  function exitOthers(except) {
+    if (except !== "note" && annotating) setAnnotating(false);
+    if (except !== "region" && regioning) setRegioning(false);
+    if (except !== "read" && reading) setReading(false);
+    if (except !== "edit" && editing) setEditing(false);
+  }
   function setAnnotating(v) {
-    if (v) { if (editing) setEditing(false); if (regioning) setRegioning(false); if (hidden) setHidden(false); }
+    if (v) { exitOthers("note"); if (hidden) setHidden(false); }
     annotating = v;
     d.documentElement.style.cursor = v ? "crosshair" : (regioning ? "crosshair" : "");
-    if (v) { openPanel(); hint("标注模式：点元素、或划选一段文字（松手即可写意见）。要操作页面交互，先点「完成标注」或按 Esc。"); }
-    else { setHover(null); if (composing && composing.kind !== "rect") composing = null; hint(null); renderPanel(); }
+    if (v) hint("标注模式：点元素、或划选一段文字（松手即可写意见）。要操作页面交互，先点「完成标注」或按 Esc。");
+    else { setHover(null); if (bubMode === "compose") hideBubble(); hint(null); }
     syncBar(); schedulePins();
   }
   function setRegioning(v) {
-    if (v) { if (editing) setEditing(false); if (annotating) setAnnotating(false); if (hidden) setHidden(false); }
+    if (v) { exitOthers("region"); if (hidden) setHidden(false); }
     regioning = v;
     d.documentElement.style.cursor = v ? "crosshair" : (annotating ? "crosshair" : "");
-    if (v) { openPanel(); hint("框选模式：按住拖一个矩形（比如流程图的箭头、两个元素之间的间距），松手写意见。Esc 退出。"); }
-    else { drag = null; ui.dragBox.style.display = "none"; if (composing && composing.kind === "rect" && !composing.saved) {} hint(null); renderPanel(); }
+    if (v) hint("框选模式：按住拖一个矩形（箭头、间距、留白都能框），松手写意见。Esc 退出。");
+    else { drag = null; ui.dragBox.style.display = "none"; if (bubMode === "compose") hideBubble(); hint(null); }
+    syncBar(); schedulePins();
+  }
+  function setReading(v) {
+    if (v) { exitOthers("read"); if (hidden) setHidden(false); closePanel(); }
+    reading = v;
+    if (v) {
+      ui.bar.hidden = true; ui.pill.hidden = false; hint(null);
+      toast("阅读模式：划选文字即划线；点已划的线可改色、写想法、删除。点右上角圆点可展开工具条。", 4500);
+    } else {
+      ui.bar.hidden = false; ui.pill.hidden = true; hideBubble();
+    }
     syncBar(); schedulePins();
   }
   function setEditing(v) {
-    if (v) { if (annotating) setAnnotating(false); if (regioning) setRegioning(false); }
+    if (v) exitOthers("edit");
     editing = v;
     try {
       if (v) { prevBodyEditable = d.body.getAttribute("contenteditable"); d.body.setAttribute("contenteditable", "true"); }
       else { if (prevBodyEditable == null) d.body.removeAttribute("contenteditable"); else d.body.setAttribute("contenteditable", prevBodyEditable); }
     } catch (e) {}
     ui.root.setAttribute("contenteditable", "false"); ui.pins.setAttribute("contenteditable", "false");
-    hint(v ? "编辑模式：直接点正文改字（Ctrl/⌘+Z 撤销）。改动只在当前页面里，「导出 HTML」才会存成文件；交互式原型的改动可能被页面脚本重画覆盖。" : null);
+    hint(v ? "编辑模式：直接点正文改字（Ctrl/⌘+Z 撤销）。「导出 HTML」才会存成文件；交互式原型的改动可能被页面脚本重画覆盖。" : null);
     syncBar(); schedulePins();
   }
   function setHidden(v) {
     hidden = v;
-    if (v) { closePanel(); if (annotating) setAnnotating(false); if (regioning) setRegioning(false); }
+    if (v) { closePanel(); hideBubble(); if (annotating) setAnnotating(false); if (regioning) setRegioning(false); if (reading) setReading(false); }
     syncBar(); schedulePins(); scheduleSave();
   }
 
-  function beginCompose(c) {
-    composing = c; editingNoteId = null; importing = false; setActive(null);
-    openPanel();
-    var ta = ui.panel.querySelector('[data-role="text"]'); if (ta) ta.focus();
+  function beginCompose(c, vx, vy) {
+    composing = c; editingNoteId = null; setActive(null);
+    refreshTarget();
+    bubCompose(vx, vy);
   }
+  function createMark(info, color) {
+    var nn = {
+      id: newId(), kind: "text", sel: info.sel, tag: info.tag, snippet: info.snippet,
+      label: "划线「" + snip(info.exact, 20) + "」",
+      exact: info.exact, prefix: info.prefix, suffix: info.suffix,
+      hl: color, text: "", time: Date.now(), done: false
+    };
+    notes.push(nn);
+    schedulePins(); scheduleSave();
+    return nn;
+  }
+
+  /* ---------------- 事件：指针 ---------------- */
   function onMove(e) {
     if (annotating) setHover(targetFor(e.target));
     if (regioning && drag) {
@@ -602,38 +752,63 @@
       var cx = b.left + b.width / 2 - window.pageXOffset, cy = b.top + b.height / 2 - window.pageYOffset;
       var host = hostForPoint(cx, cy) || d.body;
       var hr = host.getBoundingClientRect();
-      var hl = hr.left + window.pageXOffset, ht = hr.top + window.pageYOffset;
+      var hl2 = hr.left + window.pageXOffset, ht = hr.top + window.pageYOffset;
       if (!hr.width || !hr.height) return;
       beginCompose({
         kind: "rect", sel: cssPath(host), tag: host.tagName.toLowerCase(),
         snippet: snip(host.textContent, 40) || "[图]",
-        rx: (b.left - hl) / hr.width, ry: (b.top - ht) / hr.height,
+        rx: (b.left - hl2) / hr.width, ry: (b.top - ht) / hr.height,
         rw: b.width / hr.width, rh: b.height / hr.height,
         label: "框选 · " + labelFor(host)
-      });
-      refreshTarget(); schedulePins();
+      }, e.clientX, e.clientY);
+      schedulePins();
       return;
     }
-    if (!annotating) return;
+    if (!(annotating || reading)) return;
     if (inUI(e.target)) return;
     setTimeout(function () {
       var info = grabSelection();
       if (info === "toobig") { toast("选区太大了，缩小一点再划。"); return; }
-      if (info) {
-        lastTextComposeAt = Date.now();
+      if (!info) return;
+      lastTextComposeAt = Date.now();
+      var vx = info.rect ? (info.rect.left + info.rect.width / 2) : e.clientX;
+      var vy = info.rect ? info.rect.bottom : e.clientY;
+      if (reading) {
+        pendingSel = info;
+        bubSelection(vx, vy);
+      } else {
         try { window.getSelection().removeAllRanges(); } catch (err) {}
-        beginCompose(info);
-        refreshTarget(); schedulePins();
+        beginCompose(info, vx, vy);
       }
+      schedulePins();
     }, 0);
   }
   function onClick(e) {
+    /* 气泡内部的点击交给气泡自己的监听器 */
+    if (ui.bub && !ui.bub.hidden && ui.bub.contains(e.target)) return;
     var pin = e.target && e.target.closest && e.target.closest(".hna-pin");
     if (pin) {
       e.preventDefault(); e.stopPropagation();
       var id = pin.getAttribute("data-id");
-      openPanel(); composing = null; editingNoteId = null; setActive(id); renderPanel(); schedulePins();
-      var item = ui.panel.querySelector('.hna-item[data-id="' + id + '"]'); if (item) item.scrollIntoView({ block: "nearest" });
+      var n0 = byId(id);
+      if (n0) { hideBubble(); var r0 = pin.getBoundingClientRect(); bubNote(n0, r0.left + 10, r0.bottom + 2); renderPanel(); schedulePins(); }
+      return;
+    }
+    /* 点气泡外面：先收气泡（同一手势冒出来的 click 不算） */
+    if (ui.bub && !ui.bub.hidden && Date.now() - bubShownAt > 350) {
+      var wasCompose = (bubMode === "compose" || bubMode === "idea");
+      hideBubble(); renderPanel(); schedulePins();
+      if (wasCompose) { e.preventDefault(); e.stopPropagation(); return; }
+    }
+    if (reading) {
+      if (inUI(e.target)) return;
+      if (Date.now() - lastTextComposeAt < 450) { return; }
+      var hitN = findMarkAt(e.pageX, e.pageY);
+      if (hitN) {
+        e.preventDefault(); e.stopPropagation();
+        bubNote(hitN, e.clientX, e.clientY);
+        schedulePins();
+      }
       return;
     }
     if (regioning) { if (!inUI(e.target)) { e.preventDefault(); e.stopPropagation(); } return; }
@@ -646,28 +821,150 @@
       kind: "el", el: node, sel: cssPath(node), tag: node.tagName.toLowerCase(),
       snippet: snip(node.textContent, 40) || "[图]",
       label: labelFor(node)
+    }, e.clientX, e.clientY);
+  }
+
+  /* ---------------- Enter 提交（中文输入法组合态豁免） ---------------- */
+  function bindEnterSubmit(container, findPrimary) {
+    container.addEventListener("keydown", function (e) {
+      if (e.key !== "Enter" || e.shiftKey || e.altKey || e.metaKey || e.ctrlKey) return;
+      if (e.isComposing || e.keyCode === 229) return; /* 拼音候选未上屏时，Enter 是输入法的 */
+      var ta = e.target;
+      if (!ta || ta.tagName !== "TEXTAREA") return;
+      var btn2 = findPrimary(ta);
+      if (btn2) { e.preventDefault(); e.stopPropagation(); btn2.click(); }
+    }, true);
+  }
+
+  /* ---------------- 气泡按钮 ---------------- */
+  function bindBubble() {
+    bindEnterSubmit(ui.bub, function () { return ui.bub.querySelector(".hna-pri[data-bub]"); });
+    ui.bub.addEventListener("click", function (e) {
+      var dot = e.target.closest("[data-dot]");
+      if (dot) {
+        var color = dot.getAttribute("data-dot");
+        if (bubMode === "sel" && pendingSel) {
+          createMark(pendingSel, color);
+          try { window.getSelection().removeAllRanges(); } catch (err) {}
+          hideBubble();
+        } else if (bubMode === "idea" && pendingSel) {
+          pendingSel.hlPick = color;
+          ui.bub.querySelectorAll(".hna-dot").forEach(function (x) { x.classList.toggle("hna-cur", x.getAttribute("data-dot") === color); });
+        } else if (bubMode === "view" && bubNoteId) {
+          var n = byId(bubNoteId);
+          if (n) { n.hl = color; schedulePins(); scheduleSave(); ui.bub.querySelectorAll(".hna-dot").forEach(function (x) { x.classList.toggle("hna-cur", x.getAttribute("data-dot") === color); }); }
+        }
+        return;
+      }
+      var chip = e.target.closest(".hna-chip");
+      if (chip) {
+        if (chip.hasAttribute("data-cat")) lastCat = chip.getAttribute("data-cat");
+        if (chip.hasAttribute("data-sev")) lastSev = chip.getAttribute("data-sev");
+        ui.bub.querySelectorAll(".hna-chip[data-cat]").forEach(function (c2) { c2.classList.toggle("on", c2.getAttribute("data-cat") === lastCat); });
+        ui.bub.querySelectorAll(".hna-chip[data-sev]").forEach(function (c2) { c2.classList.toggle("on", c2.getAttribute("data-sev") === lastSev); });
+        return;
+      }
+      var b = e.target.closest("[data-bub]"); if (!b) return;
+      var act = b.getAttribute("data-bub");
+      if (act === "close") { hideBubble(); schedulePins(); return; }
+      if (act === "idea") { if (pendingSel) { pendingSel.hlPick = HLS[0]; bubIdeaForm(parseFloat(ui.bub.style.left) + 20, parseFloat(ui.bub.style.top)); } return; }
+      if (act === "save-idea") {
+        var ta = ui.bub.querySelector("textarea");
+        var text = (ta && ta.value || "").trim(); if (!text) { if (ta) ta.focus(); return; }
+        if (!pendingSel) { hideBubble(); return; }
+        var nn = createMark(pendingSel, pendingSel.hlPick || HLS[0]);
+        nn.text = text; nn.cat = "note"; nn.sev = "suggest";
+        nn.label = "划词「" + snip(nn.exact, 20) + "」";
+        try { window.getSelection().removeAllRanges(); } catch (err) {}
+        hideBubble(); renderPanel(); schedulePins(); scheduleSave();
+        return;
+      }
+      if (act === "post") {
+        var ta2 = ui.bub.querySelector("textarea");
+        var t2 = (ta2 && ta2.value || "").trim(); if (!t2) { if (ta2) ta2.focus(); return; }
+        if (!composing) { hideBubble(); return; }
+        var nn2 = {
+          id: newId(), kind: composing.kind === "el" ? "el" : composing.kind,
+          sel: composing.sel, tag: composing.tag, snippet: composing.snippet, label: composing.label,
+          text: t2, cat: lastCat, sev: lastSev, time: Date.now(), done: false
+        };
+        if (composing.kind === "text") { nn2.exact = composing.exact; nn2.prefix = composing.prefix; nn2.suffix = composing.suffix; }
+        if (composing.kind === "rect") { nn2.rx = composing.rx; nn2.ry = composing.ry; nn2.rw = composing.rw; nn2.rh = composing.rh; }
+        notes.push(nn2); composing = null;
+        try { window.getSelection().removeAllRanges(); } catch (err) {}
+        hideBubble(); setActive(nn2.id);
+        renderPanel(); schedulePins(); scheduleSave(); return;
+      }
+      var n2 = bubNoteId ? byId(bubNoteId) : null;
+      if (!n2) { hideBubble(); return; }
+      if (act === "add-idea") {
+        bubMode = "view";
+        ui.bub.innerHTML = '<div class="hna-tgt">' + esc(n2.label) + "</div>" +
+          '<textarea data-role="text" placeholder="写点想法…（Enter 提交，Shift+Enter 换行）"></textarea>' +
+          '<div class="hna-btns"><button type="button" data-bub="close">取消</button><button type="button" class="hna-pri" data-bub="save-add-idea">保存</button></div>';
+        var ta3 = ui.bub.querySelector("textarea"); if (ta3) ta3.focus();
+        return;
+      }
+      if (act === "save-add-idea") {
+        var ta4 = ui.bub.querySelector("textarea");
+        var t4 = (ta4 && ta4.value || "").trim(); if (!t4) { if (ta4) ta4.focus(); return; }
+        n2.text = t4; n2.cat = "note"; n2.sev = n2.sev || "suggest";
+        hideBubble(); renderPanel(); schedulePins(); scheduleSave(); return;
+      }
+      if (act === "edit") { bubNote(n2, parseFloat(ui.bub.style.left) + 20, parseFloat(ui.bub.style.top) + 10, true); return; }
+      if (act === "save-edit") {
+        var ta5 = ui.bub.querySelector("textarea");
+        var t5 = (ta5 && ta5.value || "").trim(); if (!t5) { if (ta5) ta5.focus(); return; }
+        n2.text = t5; n2.cat = lastCat; n2.sev = lastSev;
+        hideBubble(); renderPanel(); schedulePins(); scheduleSave(); return;
+      }
+      if (act === "done") { n2.done = !n2.done; hideBubble(); renderPanel(); schedulePins(); scheduleSave(); return; }
+      if (act === "del") {
+        if (!b.getAttribute("data-armed")) { b.setAttribute("data-armed", "1"); b.textContent = "确认删除"; return; }
+        notes = notes.filter(function (z) { return z !== n2; });
+        if (activeId === n2.id) setActive(null);
+        hideBubble(); renderPanel(); schedulePins(); scheduleSave(); return;
+      }
     });
-    refreshTarget();
   }
 
   /* ---------------- 清单（文字版） ---------------- */
   function locLine(n) {
+    if (isMark(n)) return "划线「" + n.exact + "」";
     if (n.kind === "text") return "划词「" + n.exact + "」（所在块：" + (n.snippet || "") + "）";
     if (n.kind === "rect") return "框选区域，挂在 " + (n.label || "").replace(/^框选 · /, "") + "（相对位置 " + Math.round(n.rx * 100) + "%," + Math.round(n.ry * 100) + "%）";
     return (n.label || "") + (n.sel ? "（" + n.sel + "）" : "");
   }
+  function docOrder(a, b) {
+    var na = noteBoxes(a), nb = noteBoxes(b);
+    var ya = na ? (na.boxes.length ? na.boxes[0].top : na.pin.y) : 1e12;
+    var yb = nb ? (nb.boxes.length ? nb.boxes[0].top : nb.pin.y) : 1e12;
+    return ya === yb ? a.time - b.time : ya - yb;
+  }
   function listMD() {
     var open = notes.filter(function (n) { return !n.done; }).length;
-    var must = notes.filter(function (n) { return !n.done && n.sev === "must"; }).length;
+    var must = notes.filter(function (n) { return !n.done && n.sev === "must" && !isMark(n); }).length;
+    var marks = notes.filter(isMark);
     var t = new Date();
     var out = [];
     out.push("# 《" + (d.title || "页面") + "》标注清单");
-    out.push("导出：" + t.getFullYear() + "-" + pad(t.getMonth() + 1) + "-" + pad(t.getDate()) + " " + pad(t.getHours()) + ":" + pad(t.getMinutes()) + " ｜ 共 " + notes.length + " 条，未完成 " + open + " 条，必改 " + must + " 条");
+    out.push("导出：" + t.getFullYear() + "-" + pad(t.getMonth() + 1) + "-" + pad(t.getDate()) + " " + pad(t.getHours()) + ":" + pad(t.getMinutes()) + " ｜ 共 " + notes.length + " 条（划线摘录 " + marks.length + "），未完成 " + open + "，必改 " + must);
     out.push("");
-    out.push("给 AI 的说明：以下标注针对同名 HTML 页面，按类型分组、必改在前。「位置」给出了元素路径或划词原文，请逐条评估并直接修改该 HTML；不建议执行的条目请说明原因。");
-    out.push("");
+    if (marks.length) {
+      out.push("## 摘录划线（" + marks.length + " 条，按原文顺序）");
+      out.push("");
+      marks.slice().sort(docOrder).forEach(function (n) {
+        out.push("> " + n.exact.replace(/\s*\n\s*/g, " "));
+        out.push("");
+      });
+    }
+    var hasReview = notes.some(function (n) { return !isMark(n); });
+    if (hasReview) {
+      out.push("给 AI 的说明：以下意见针对同名 HTML 页面，按类型分组、必改在前。「位置」给出了元素路径或原文，请逐条评估并直接修改该 HTML；不建议执行的条目请说明原因。");
+      out.push("");
+    }
     Object.keys(CATS).forEach(function (ck) {
-      var group = notes.filter(function (n) { return (n.cat || "visual") === ck; });
+      var group = notes.filter(function (n) { return !isMark(n) && (n.cat || "visual") === ck; });
       if (!group.length) return;
       group.sort(function (a, b2) { return (a.sev === "must" ? 0 : 1) - (b2.sev === "must" ? 0 : 1); });
       out.push("## " + CATS[ck] + "（" + group.length + " 条）");
@@ -701,12 +998,12 @@
     } catch (e) { toast("这里导出不了文件，请改用「复制全文」。", 4500); return false; }
   }
   function openListModal() {
-    if (!notes.length) { toast("还没有标注，先点「标注」或「框选」留几条。"); return; }
+    if (!notes.length) { toast("还没有标注：「标注」「框选」「阅读」任选一个开始。"); return; }
     if (!modal) {
       modal = el("div", "hna-mask"); modal.hidden = true;
       modal.innerHTML = '<div class="hna-modal"><div class="hna-mh"><span>标注清单</span><button type="button" data-lm="close">✕</button></div>' +
         '<textarea readonly spellcheck="false"></textarea>' +
-        '<div class="hna-mb"><span class="hna-tip">复制全文粘给 AI；「带图报告」逐条截图生成一份图文 HTML</span>' +
+        '<div class="hna-mb"><span class="hna-tip">复制全文粘给 AI 或丢进笔记库；「带图报告」逐条截图生成图文 HTML</span>' +
         '<button type="button" class="hna-pri" data-lm="copy">复制全文</button>' +
         '<button type="button" data-lm="dl">下载 .md</button>' +
         (hasRuntime ? '<button type="button" data-lm="report">带图报告</button>' : "") +
@@ -757,7 +1054,7 @@
       im.src = url;
     });
   }
-  function cropShot(img, vb, color, num) { /* vb: viewport 坐标矩形 */
+  function cropShot(img, vb, color, num) {
     var scale = img.naturalWidth / window.innerWidth;
     var padPx = 36;
     var x = Math.max(0, (vb.left - padPx)), y = Math.max(0, (vb.top - padPx));
@@ -767,7 +1064,6 @@
     cv.width = Math.round(w * scale); cv.height = Math.round(h * scale);
     var ctx = cv.getContext("2d");
     ctx.drawImage(img, x * scale, y * scale, w * scale, h * scale, 0, 0, cv.width, cv.height);
-    /* 目标描边 + 序号角标 */
     ctx.lineWidth = Math.max(2, 2 * scale);
     ctx.strokeStyle = color;
     ctx.strokeRect((vb.left - x) * scale, (vb.top - y) * scale, vb.width * scale, vb.height * scale);
@@ -783,9 +1079,11 @@
     if (!hasRuntime) { toast("这个环境拿不到截图能力。"); return; }
     if (capturing) return;
     capturing = true;
-    var wasHidden = hidden, wasAnn = annotating, wasReg = regioning, wasEdit = editing;
-    if (wasAnn) setAnnotating(false); if (wasReg) setRegioning(false); if (wasEdit) setEditing(false);
+    var wasHidden = hidden, wasAnn = annotating, wasReg = regioning, wasEdit = editing, wasRead = reading;
+    if (wasAnn) setAnnotating(false); if (wasReg) setRegioning(false); if (wasEdit) setEditing(false); if (wasRead) setReading(false);
+    hideBubble();
     var sx = window.pageXOffset, sy = window.pageYOffset;
+    var oldTitle = d.title;
     ui.root.style.visibility = "hidden"; ui.pins.style.visibility = "hidden";
     renderPins();
     var items = [], i = 0;
@@ -793,6 +1091,7 @@
     function step() {
       if (i >= seq.length) { finish(); return; }
       var n = seq[i]; i++;
+      try { d.title = "截图 " + i + "/" + seq.length + "…"; } catch (e) {}
       var nb = noteBoxes(n);
       if (!nb) { items.push({ n: n, img: null }); step(); return; }
       var box = nb.boxes.length ? unionBox(nb.boxes) : { left: nb.pin.x - 60, top: nb.pin.y, width: 120, height: 60 };
@@ -803,13 +1102,11 @@
         vb.left = Math.max(0, vb.left); vb.top = Math.max(0, vb.top);
         vb.width = Math.min(vb.width, window.innerWidth - vb.left);
         vb.height = Math.min(vb.height, window.innerHeight - vb.top);
-        toast("截图 " + i + "/" + seq.length + "…", 2000);
-        ui.toast.hidden = true; /* toast 不能进截图 */
         captureTab().then(function (dataUrl) { return loadImg(dataUrl); }).then(function (img) {
           var shot = null;
           try { shot = cropShot(img, vb, catColor(n), noteIndex(n) + 1); } catch (e) { shot = null; }
           items.push({ n: n, img: shot });
-          setTimeout(step, 650); /* captureVisibleTab 有频率限制 */
+          setTimeout(step, 650);
         }, function (err) {
           items.push({ n: n, img: null, err: String(err && err.message || err) });
           setTimeout(step, 650);
@@ -817,6 +1114,7 @@
       }, 420);
     }
     function finish() {
+      try { d.title = oldTitle; } catch (e) {}
       window.scrollTo(sx, sy);
       ui.root.style.visibility = ""; ui.pins.style.visibility = "";
       capturing = false;
@@ -831,7 +1129,7 @@
   function reportHTML(items) {
     var t = new Date();
     var open = notes.filter(function (n) { return !n.done; }).length;
-    var must = notes.filter(function (n) { return !n.done && n.sev === "must"; }).length;
+    var must = notes.filter(function (n) { return !n.done && n.sev === "must" && !isMark(n); }).length;
     var h = "<!doctype html>\n<html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
       "<title>标注报告 · " + esc(d.title || fileBase()) + "</title><style>" +
       "body{margin:0;background:#F5F6F3;color:#2C2A26;font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;font-size:14px;line-height:1.7}" +
@@ -848,14 +1146,24 @@
       ".st{font-size:10.5px;color:#7A776F;margin-left:auto}" +
       ".loc{font-size:11px;color:#7A776F;margin:6px 0 2px;word-break:break-all}" +
       ".txt{margin:4px 0 8px;white-space:pre-wrap}" +
+      "blockquote{margin:4px 0 8px;padding:6px 12px;border-left:3px solid #C9B27A;background:#FBF7EE;border-radius:0 8px 8px 0}" +
       "img{max-width:100%;border:1px solid #E3E2DA;border-radius:8px;display:block}" +
       ".noimg{font-size:11px;color:#7A776F;border:1px dashed #D8D5CC;border-radius:8px;padding:10px;text-align:center}" +
       "</style></head><body><div class=\"wrap\">" +
       "<h1>标注报告 · " + esc(d.title || fileBase()) + "</h1>" +
       "<div class=\"meta\">" + t.getFullYear() + "-" + pad(t.getMonth() + 1) + "-" + pad(t.getDate()) + " " + pad(t.getHours()) + ":" + pad(t.getMinutes()) +
       " ｜ 共 " + notes.length + " 条 · 未完成 " + open + " · 必改 " + must + "</div>";
+    var markItems = items.filter(function (it) { return isMark(it.n); });
+    if (markItems.length) {
+      h += "<h2>摘录划线（" + markItems.length + "）</h2>";
+      markItems.forEach(function (it) {
+        var n = it.n;
+        h += "<div class=\"card\"><blockquote>" + esc(n.exact) + "</blockquote>" +
+          (it.img ? "<img src=\"" + it.img + "\" alt=\"划线截图\">" : "") + "</div>";
+      });
+    }
     Object.keys(CATS).forEach(function (ck) {
-      var group = items.filter(function (it) { return ((it.n.cat || "visual") === ck); });
+      var group = items.filter(function (it) { return !isMark(it.n) && ((it.n.cat || "visual") === ck); });
       if (!group.length) return;
       group.sort(function (a, b2) { return (a.n.sev === "must" ? 0 : 1) - (b2.n.sev === "must" ? 0 : 1); });
       h += "<h2>" + CATS[ck] + "（" + group.length + "）</h2>";
@@ -918,40 +1226,43 @@
     });
   }
 
-  /* ---------------- UI 显隐（再次点插件图标） ---------------- */
+  /* ---------------- UI 显隐 ---------------- */
   window.__hnaToggleUI = function () {
     if (!ui.root) return;
     uiVisible = !uiVisible;
     ui.root.style.display = uiVisible ? "" : "none";
-    if (!uiVisible) { if (annotating) setAnnotating(false); if (regioning) setRegioning(false); if (editing) setEditing(false); }
+    if (!uiVisible) { if (annotating) setAnnotating(false); if (regioning) setRegioning(false); if (editing) setEditing(false); if (reading) setReading(false); }
     schedulePins();
   };
 
-  /* ---------------- 事件 ---------------- */
+  /* ---------------- 事件绑定 ---------------- */
   function bind() {
     ui.bar.addEventListener("click", function (e) {
       var b = e.target.closest("[data-hna]"); if (!b) return;
       var act = b.getAttribute("data-hna");
       if (act === "note") setAnnotating(!annotating);
       else if (act === "region") setRegioning(!regioning);
+      else if (act === "read") setReading(!reading);
       else if (act === "hide") setHidden(!hidden);
       else if (act === "edit") setEditing(!editing);
-      else if (act === "list") openListModal();
+      else if (act === "list") { if (ui.panel.hidden) openPanel(); else closePanel(); }
       else if (act === "export") doExport();
       else if (act === "overview") { try { chrome.runtime.sendMessage({ type: "hna-overview" }); } catch (err) {} }
       else if (act === "fold") window.__hnaToggleUI();
     });
+    ui.pill.addEventListener("click", function () {
+      ui.bar.hidden = false; ui.pill.hidden = true;
+    });
     ui.panel.addEventListener("click", function (e) {
       var chip = e.target.closest(".hna-chip");
+      if (chip && chip.hasAttribute("data-filter")) { catFilter = chip.getAttribute("data-filter"); renderPanel(); schedulePins(); return; }
       if (chip) {
-        if (chip.hasAttribute("data-filter")) { catFilter = chip.getAttribute("data-filter"); renderPanel(); schedulePins(); return; }
         var form = chip.closest(".hna-form");
         if (form) {
-          if (chip.hasAttribute("data-cat")) { lastCat = chip.getAttribute("data-cat"); }
-          if (chip.hasAttribute("data-sev")) { lastSev = chip.getAttribute("data-sev"); }
+          if (chip.hasAttribute("data-cat")) lastCat = chip.getAttribute("data-cat");
+          if (chip.hasAttribute("data-sev")) lastSev = chip.getAttribute("data-sev");
           form.querySelectorAll(".hna-chip[data-cat]").forEach(function (c2) { c2.classList.toggle("on", c2.getAttribute("data-cat") === lastCat); });
           form.querySelectorAll(".hna-chip[data-sev]").forEach(function (c2) { c2.classList.toggle("on", c2.getAttribute("data-sev") === lastSev); });
-          return;
         }
         return;
       }
@@ -973,24 +1284,10 @@
       var b = e.target.closest("[data-act]"); if (!b) return;
       var act = b.getAttribute("data-act"), id = b.getAttribute("data-id"), n = id ? byId(id) : null;
       if (act === "close") { closePanel(); return; }
+      if (act === "export-open") { openListModal(); return; }
       if (act === "toggle-done") { showDone = b.checked; renderPanel(); schedulePins(); return; }
       if (act === "import") { importing = true; renderPanel(); return; }
       if (act === "cancel-import") { importing = false; renderPanel(); return; }
-      if (act === "cancel") { composing = null; setActive(null); renderPanel(); schedulePins(); return; }
-      if (act === "post") {
-        var ta = ui.panel.querySelector('[data-role="text"]');
-        var text = (ta && ta.value || "").trim(); if (!text) { if (ta) ta.focus(); return; }
-        if (!composing) return;
-        var nn = {
-          id: newId(), kind: composing.kind === "el" ? "el" : composing.kind,
-          sel: composing.sel, tag: composing.tag, snippet: composing.snippet, label: composing.label,
-          text: text, cat: lastCat, sev: lastSev, time: Date.now(), done: false
-        };
-        if (composing.kind === "text") { nn.exact = composing.exact; nn.prefix = composing.prefix; nn.suffix = composing.suffix; }
-        if (composing.kind === "rect") { nn.rx = composing.rx; nn.ry = composing.ry; nn.rw = composing.rw; nn.rh = composing.rh; }
-        notes.push(nn); composing = null; setActive(nn.id);
-        renderPanel(); schedulePins(); scheduleSave(); return;
-      }
       if (!n) return;
       if (act === "locate") {
         setActive(n.id);
@@ -998,7 +1295,7 @@
         if (nb) scrollToBox(nb.boxes.length ? unionBox(nb.boxes) : { left: nb.pin.x, top: nb.pin.y, width: 10, height: 10 });
         renderPanel(); schedulePins(); return;
       }
-      if (act === "edit") { editingNoteId = n.id; composing = null; lastCat = n.cat || "visual"; lastSev = n.sev || "suggest"; renderPanel(); var rt = ui.panel.querySelector('[data-role="edittext"]'); if (rt) rt.focus(); return; }
+      if (act === "edit") { editingNoteId = n.id; lastCat = n.cat || "visual"; lastSev = n.sev || "suggest"; renderPanel(); var rt = ui.panel.querySelector('[data-role="edittext"]'); if (rt) rt.focus(); return; }
       if (act === "cancel-edit") { editingNoteId = null; renderPanel(); return; }
       if (act === "save-edit") {
         var ta2 = ui.panel.querySelector('[data-role="edittext"]');
@@ -1018,6 +1315,11 @@
       var b = e.target.closest('[data-act="toggle-done"]');
       if (b) { showDone = b.checked; renderPanel(); schedulePins(); }
     });
+    bindEnterSubmit(ui.panel, function (ta) {
+      var form = ta.closest(".hna-form");
+      return form ? form.querySelector('[data-act="save-edit"]') : null;
+    });
+    bindBubble();
     d.addEventListener("mousemove", onMove, true);
     d.addEventListener("mousedown", onDown, true);
     d.addEventListener("mouseup", onUp, true);
@@ -1029,13 +1331,18 @@
     d.addEventListener("keydown", function (e) {
       if (e.key !== "Escape") return;
       if (modal && !modal.hidden) { modal.hidden = true; e.stopPropagation(); return; }
-      if (regioning) { if (drag) { drag = null; ui.dragBox.style.display = "none"; } else if (composing) { composing = null; renderPanel(); schedulePins(); } else setRegioning(false); e.stopPropagation(); return; }
-      if (annotating) { if (composing) { composing = null; setActive(null); renderPanel(); schedulePins(); } else setAnnotating(false); e.stopPropagation(); }
+      if (ui.bub && !ui.bub.hidden) { hideBubble(); schedulePins(); e.stopPropagation(); return; }
+      if (reading) { setReading(false); e.stopPropagation(); return; }
+      if (regioning) { if (drag) { drag = null; ui.dragBox.style.display = "none"; } else setRegioning(false); e.stopPropagation(); return; }
+      if (annotating) { setAnnotating(false); e.stopPropagation(); }
     }, true);
     window.addEventListener("resize", schedulePins);
     window.addEventListener("load", schedulePins);
     if (d.fonts && d.fonts.ready) d.fonts.ready.then(schedulePins);
-    d.addEventListener("scroll", schedulePins, true);
+    d.addEventListener("scroll", function () {
+      if (bubMode === "sel") { hideBubble(); }
+      schedulePins();
+    }, true);
     if (window.MutationObserver) {
       var mo = new MutationObserver(function (records) {
         for (var i = 0; i < records.length; i++) {
@@ -1059,9 +1366,12 @@
       } else if (embedded) {
         notes = embedded.notes || []; hidden = !!embedded.hidden;
       }
-      notes.forEach(function (n) { if (!n.kind) n.kind = "el"; if (!n.cat) n.cat = "visual"; if (!n.sev) n.sev = "suggest"; });
+      notes.forEach(function (n) {
+        if (!n.kind) n.kind = "el";
+        if (!isMark(n)) { if (!n.cat) n.cat = "visual"; if (!n.sev) n.sev = "suggest"; }
+      });
       syncBar(); schedulePins();
-      if (notes.length) toast("已载入 " + notes.length + " 条标注（" + (hidden ? "当前隐藏" : "点钉子查看") + "）。", 3500);
+      if (notes.length) toast("已载入 " + notes.length + " 条标注（" + (hidden ? "当前隐藏" : "点钉子或划线查看") + "）。", 3500);
     });
   }
   if (d.readyState === "loading") d.addEventListener("DOMContentLoaded", boot);
